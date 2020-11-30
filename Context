@@ -1,0 +1,1949 @@
+private static Guid Id = Guid.Parse("465A46EC-898C-49CE-AEC2-7E41355DB047");
+
+        private ILog log = LogManager.GetLogger(typeof(ContextContainer));
+
+        private Dictionary<Guid, ModuleSettingCollection> _ModuleSettings = new Dictionary<Guid, ModuleSettingCollection>();
+        private Dictionary<Guid, String> _ModuleNames;
+        private AppSettingCollection _AppSettings;
+
+        private LoginHandler _LoginHandler;
+        private RoleService _RoleService;
+        private EmailService _EmailService;
+        private MenuService _MenuService;
+        private SMSService _SMSService;
+        private Language[] _Languages;
+        private ModuleHandler[] _installedModules;
+        private ModuleHandler[] _allowedModules;
+        private ExtensionHandler[] _allowedExtensions;
+        private HttpContext _HttpContext;
+        private AssociateService _AssociateService;
+
+        public CultureInfo CurrentCulture { get; private set; }
+        public CultureInfo CompanyCulture { get; private set; }
+        public TerminologyProcessor Terminology { get; private set; }
+        public bool Disposed { get; set; }
+        public EditionEnum Edition { get; private set; }
+        public UIVersion UIVersion { get; private set; }
+
+        public LicenseException LicenseException { get; internal set; }
+
+        private ActionContext _ActionContext;
+
+        private int? _CompanyId { get; set; }
+        private int? _UserId { get; set; }
+        private int? _UserCompanyId { get; set; }
+        private String _SessionId { get; set; }
+
+        private String _CompanyName { get; set; }
+        private String _UserDisplayName { get; set; }
+
+        private static Dictionary<int, AppSettingCollectionCache> AppSettingsCache = new Dictionary<int, AppSettingCollectionCache>();
+        private static Dictionary<int, Dictionary<Guid, ModuleSettingCollectionCache>> ModuleSettingsCache = new Dictionary<int, Dictionary<Guid, ModuleSettingCollectionCache>>();
+        private static MenuCacheService _MenuCacheService;
+        private static RoleCacheService _RoleCacheService;
+
+        internal void Init()
+        {
+            try
+            {
+                if (!String.IsNullOrWhiteSpace(AppSettings["CompanyCulture"]))
+                    CompanyCulture = new CultureInfo(AppSettings["CompanyCulture"]);
+                else
+                    CompanyCulture = new CultureInfo("en-IN");
+            }
+            catch (Exception)
+            {
+                CompanyCulture = new CultureInfo("en-IN");
+            }
+
+            try
+            {
+                Edition = Helpers.Edition;
+            }
+            catch (Exception e)
+            {
+                throw new Exception("Edition is not valid", e);
+            }
+
+            try
+            {
+                String StrUIVersion = HttpContext.Request.Cookies.ContainsKey("UIVersion") ? HttpContext.Request.Cookies["UIVersion"] : String.Empty;
+
+                int UIVersionId;
+
+                int.TryParse(StrUIVersion, out UIVersionId);
+
+                if(UIVersionId == 0)
+                    UIVersionId = (int)UIVersion.Version2; 
+
+                UIVersion = (UIVersion)UIVersionId;
+
+                if (String.IsNullOrWhiteSpace(StrUIVersion) && UserId != null)
+                {
+                    var user = (from a in CoreEntities.OM_User where a.UserId == UserId select a).FirstOrDefault();
+
+                    if (user.UIVersion != null) 
+                    {
+                        UIVersion = (UIVersion)user.UIVersion.Value;
+                    }
+                    else
+                    {
+                        user.UIVersion = (int)UIVersion;
+                        CoreEntities.SaveChanges();
+                    }
+
+                    SetUIVersionCookie(UIVersion);
+                }
+            }
+            catch (Exception)
+            {
+                UIVersion = Models.UIVersion.Version2;
+            }
+
+            OnInit();
+        }
+
+        protected virtual void OnInit()
+        {
+            var lang = HttpContext.Request.Cookies.ContainsKey("lang") ? HttpContext.Request.Cookies["lang"] : null;
+
+            try
+            {
+                if (lang != null)
+                    UpdateLanguage(lang);
+                else
+                    UpdateCulture(CompanyCulture);
+            }
+            catch (Exception)
+            {
+                UpdateCulture(CompanyCulture);
+            }
+        }
+
+        internal void InitView()
+        {
+            ContextContainerConfiguration.Get.SetContextContainer(HttpContext, this);
+        }
+
+        /// <summary>
+        /// Activator
+        /// </summary>
+        public abstract LicenseAct License { get; }
+
+        /// <summary>
+        /// Holds all the ResourceManager
+        /// </summary>
+        public ResourcesCollection Resources { get; protected set; }
+
+        /// <summary>
+        /// It contains all the connection strings to be used by the application.
+        /// </summary>
+        public ConnectionStringCollection ConnectionStrings { get; private set; }
+
+        /// <summary>
+        /// Contain the Application level Settings. It do a lazy loading of those settings. 
+        /// Use Reset method to clear the cached setting and make it to reload all the setting.
+        /// </summary>
+        public AppSettingCollection AppSettings
+        {
+            get
+            {
+                if (_AppSettings == null)
+                    _AppSettings = LoadAppSettings();
+
+                return _AppSettings;
+            }
+        }
+
+        /// <summary>
+        /// Contain the current Module level Settings. It do a lazy loading of those settings. 
+        /// Use Reset method to clear the cached setting and make it to reload all the setting.
+        /// </summary>
+        public ModuleSettingCollection ModuleSettings
+        {
+            get
+            {
+                if (Module == null)
+                    throw new InvalidOperationException("Module is not initialized");
+
+                return GetModuleSettings(Module.ModuleId);
+            }
+        }
+
+        public ModuleSettingCollection GetModuleSettings(Guid ModuleId)
+        {
+            ModuleHandler module = GetModuleHandler(ModuleId);
+            return LoadModuleSettings(module);
+        }
+
+        private ModuleSettingCollection LoadModuleSettings(ModuleHandler module)
+        {
+            if (_ModuleSettings.ContainsKey(module.ModuleId))
+                return _ModuleSettings[module.ModuleId];
+
+            ModuleSettingCollection setting = null;
+
+            lock (ModuleSettingsCache)
+            {
+                if (!ModuleSettingsCache.ContainsKey(this.CompanyId ?? 0))
+                    ModuleSettingsCache[this.CompanyId ?? 0] = new Dictionary<Guid, ModuleSettingCollectionCache>();
+
+                if (!ModuleSettingsCache[this.CompanyId ?? 0].ContainsKey(module.ModuleId))
+                    ModuleSettingsCache[this.CompanyId ?? 0][module.ModuleId] = ModuleSettingCollectionCache.GetCache(ContextTypeId, module.ModuleId, this.CompanyId ?? 0);
+
+                setting = new ModuleSettingCollection(this, module, ModuleSettingsCache[this.CompanyId ?? 0][module.ModuleId], null);
+            }
+
+            if (setting == null)
+                setting = new ModuleSettingCollection(this, module);
+
+            _ModuleSettings.Add(module.ModuleId, setting);
+
+            return setting;
+        }
+
+        public ModuleSettingCollection GetModuleSettings(String ModulePath)
+        {
+            ModuleHandler module = GetModuleHandler(ModulePath);
+
+            return LoadModuleSettings(module);
+        }
+
+        
+
+        /// <summary>
+        /// Current Module Handler if the request is module specific
+        /// else will return NULL
+        /// </summary>
+        public virtual ModuleHandler Module { get; internal set; }
+
+        internal virtual ModuleHandler[] AllModules { get; set; }
+
+        public virtual ModuleHandler[] InstalledModules
+        {
+            get
+            {
+                if(_installedModules == null)
+                {
+                    var coreEntities = CoreEntities;
+
+                    var isSuperAdmin = this.RoleService.IsUserSuperAdmin();
+
+                    var modules = (from module in coreEntities.OM_Modules
+                                         where isSuperAdmin || module.Enabled
+                                         select new { module.ModuleId, Sort = module.Sort == 0 ? 9999 : module.Sort }).ToDictionary(a => a.ModuleId);
+
+                    ReadOnlyDictionary<Guid, int> LicensedModules = null;
+
+                    if (License != null)
+                    {
+                        LicensedModules = License.Modules;
+                    }
+
+                    _installedModules = (from a in AllModules
+                                         let m = modules.ContainsKey(a.ModuleId) ? modules[a.ModuleId] : null
+                                         where m != null && (LicensedModules == null || a.CustomModule || LicensedModules.ContainsKey(a.ModuleId))
+                                       orderby m.Sort 
+                                       select a).Distinct().ToArray();
+                }
+
+                return _installedModules;
+            }
+        }
+
+        public virtual T GetUserClaim<T>(String Name)
+        {
+            ClaimsPrincipal User = this.User as ClaimsPrincipal;
+
+            if (User == null)
+                return default(T);
+
+            var claim = User.FindFirst(Name);
+
+            if (claim == null || claim.Value == null)
+                return default(T);
+
+            var type = typeof(T);
+
+            if (type.IsGenericType && type.GetGenericTypeDefinition().Equals(typeof(Nullable<>)))
+                type = Nullable.GetUnderlyingType(type);
+            
+            return (T) Convert.ChangeType(claim.Value, type);
+        }
+
+        public virtual bool SetUserClaim(params Claim[] claims)
+        {
+            ClaimsPrincipal User = this.User as ClaimsPrincipal;
+
+            if (!User.Identity.IsAuthenticated)
+                return false;
+
+            ClaimsIdentity claimIdentity = User.Identities.Where(a => !(a is WindowsIdentity)).FirstOrDefault();
+
+            if (claimIdentity == null)
+                return false;
+
+            foreach (var item in claims)
+            {
+                var existingClaims = claimIdentity.FindAll(item.Type);
+
+                foreach (var claim in existingClaims)
+                    claimIdentity.RemoveClaim(claim);
+
+                claimIdentity.AddClaim(item);
+            }
+
+            var IsPersistent = GetUserClaim<bool?>(ClaimTypes.IsPersistent) as bool? ?? false;
+
+            HttpContext.SignInAsync(User, new AuthenticationProperties() { IsPersistent = IsPersistent });
+
+            //TODO: Login
+            //OwinContext.Authentication.AuthenticationResponseGrant = new Microsoft.Owin.Security.AuthenticationResponseGrant(claimIdentity, new AuthenticationProperties() { IsPersistent = IsPersistent });
+
+            return true;
+        }
+
+        public int? UserCompanyId
+        {
+            get
+            {
+                if (_UserCompanyId == null)
+                    _UserCompanyId = GetUserClaim<int?>(Constants.Session.UserCompanyId);
+
+                return _UserCompanyId;
+            }
+        }
+
+        public virtual ModuleHandler[] Modules
+        {
+            get
+            {
+                if (_allowedModules == null && UserId != null)
+                {
+                    var coreEntities = CoreEntities;
+
+                    var isSuperAdmin = this.RoleService.IsUserSuperAdmin();
+
+                    List<Guid> allowedModulesIds = null;
+
+                    if (UserCompanyId == CompanyId || isSuperAdmin)
+                    {
+                        allowedModulesIds = (from role in coreEntities.OM_UserInRoles
+                                             join rolemodule in coreEntities.OM_RolesForModules on new { CompanyId = CompanyId, RoleId = role.RoleId, ModuleId = role.ModuleId } equals new { CompanyId = (int?)rolemodule.CompanyId, RoleId = rolemodule.RoleId, ModuleId = (Guid?)rolemodule.ModuleId }
+                                             where role.UserId == UserId
+                                             select rolemodule.ModuleId).Distinct().ToList();
+
+                        if (isSuperAdmin)
+                        {
+                            allowedModulesIds.AddRange((from module in coreEntities.OM_RolesForModules
+                                                        where module.OM_Roles.Name == "SuperAdmin" && module.CompanyId == 0
+                                                        select module.ModuleId).Distinct().ToList());
+                        }
+                    }
+                    else
+                    {
+                        allowedModulesIds = (from module in coreEntities.OM_RolesForModules
+                                                    join rolemodule in coreEntities.OM_UserInCompanyModule on module.ModuleId equals rolemodule.ModuleId
+                                                    where rolemodule.OM_UserInCompany.UserId == UserId && module.CompanyId == CompanyId
+                                                    select module.ModuleId).Distinct().ToList();
+                    }
+
+                    _allowedModules = (from a in InstalledModules where allowedModulesIds.Contains(a.ModuleId) select a).ToArray();
+                }
+
+                return _allowedModules ?? new ModuleHandler[0];
+            }
+        }
+
+        public bool CheckLicensed
+        {
+            get
+            {
+#if !DEBUG || TEST_LICENSE
+                return true;
+#else
+                return false;
+#endif
+            }
+        }
+
+        public T GetLicenseProperty<T>(Guid PropertyId)
+        {
+            if (License == null)
+                return default(T);
+
+            if (!License.Properties.ContainsKey(PropertyId))
+                return default(T);
+
+            if (String.IsNullOrWhiteSpace(License.Properties[PropertyId]))
+                return default(T);
+
+            var type = typeof(T);
+
+            if (type.IsGenericType && type.GetGenericTypeDefinition().Equals(typeof(Nullable<>)))
+                type = Nullable.GetUnderlyingType(type);
+
+            return (T)Convert.ChangeType(License.Properties[PropertyId], type);
+        }
+
+        public ModuleHandler[] ViewableModules
+        {
+            get
+            {
+                return Modules.Where(a => a.Viewable).ToArray();
+            }
+        }
+
+        public virtual ExtensionHandler[] InstalledExtensions { get; internal set; }
+
+        public virtual ExtensionHandler[] Extensions
+        {
+            get
+            {
+                if (InstalledExtensions == null)
+                {
+                    InstalledExtensions = new ExtensionHandler[0];
+                }
+
+                if (_allowedExtensions == null)
+                {
+                    var coreEntities = CoreEntities;
+
+                    List<Guid> allowedExtensionsIds = null;
+
+                    allowedExtensionsIds = (from a in coreEntities.OM_Extensions
+                                            where a.Enabled
+                                         select a.ExtensionId).Distinct().ToList();
+
+
+                    ReadOnlyDictionary<Guid, bool> LicensedExtensions = null;
+
+                    if (License != null)
+                    {
+                        LicensedExtensions = License.Extensions;
+                    }
+
+                    _allowedExtensions = (from a in InstalledExtensions where allowedExtensionsIds.Contains(a.ExtensionId) && (!a.NeedLicense || LicensedExtensions == null || LicensedExtensions.ContainsKey(a.ExtensionId)) select a).ToArray();
+                }
+
+                return _allowedExtensions;
+            }
+        }
+
+        public virtual String UserIPAddress
+        {
+            get
+            {
+                string VisitorsIPAddr = HttpContext.Connection.RemoteIpAddress.ToString();
+
+                return VisitorsIPAddr;
+            }
+        }
+
+        private CoreEntities _CoreDB;
+        private ContextCache _Cache;
+
+        protected ContextContainer()
+        {
+            ConnectionStrings = new ConnectionStringCollection(this);
+            Resources = new ResourcesCollection();
+            Terminology = new TerminologyProcessor(this);
+            CurrentCulture = CultureInfo.CurrentUICulture;
+        }
+
+        public ContextCache Cache { 
+            get
+            {
+                if (_Cache == null)
+                    _Cache = ContextCache.GetCache(Id);
+
+                return _Cache;
+            }
+        }
+
+        protected AppSettingCollection LoadAppSettings()
+        {
+            lock (AppSettingsCache)
+            {
+                if (this.CompanyId != null)
+                {
+                    if (!AppSettingsCache.ContainsKey(this.CompanyId.Value))
+                        AppSettingsCache[this.CompanyId.Value] = AppSettingCollectionCache.GetCache(ContextTypeId, this.CompanyId.Value);
+                    
+                    return new AppSettingCollection(this, AppSettingsCache[this.CompanyId.Value], null);
+                }
+                else {
+                        return new AppSettingCollection(this);
+                }
+            }
+        }
+
+        private Object languageLock = new Object();
+        public Language[] Languages
+        {
+            get
+            {
+                lock (languageLock)
+                {
+                    if (_Languages == null)
+                    {
+                        var Cultures = (from a in CoreEntities.OM_Culture select a).ToList();
+                        _Languages = (from a in Crystal.Core.Resources.Util.InstalledLanguages
+                                      join b in Cultures on a.Name equals b.CultureCode into gp
+                                      orderby a.Name
+                                      select new Language() { CultureCode = a.Name, Name = String.IsNullOrWhiteSpace(a.Name) ? "English" : a.EnglishName, NativeName = String.IsNullOrWhiteSpace(a.Name) ? "English" : a.NativeName }).ToArray();
+
+                    }
+                }
+
+                return _Languages;
+            }
+        }
+
+        public virtual CoreEntities CoreEntities
+        {
+            get
+            {
+                if (_CoreDB == null)
+                {
+                    _CoreDB = CoreEntities.Create(this);
+                }
+
+                return _CoreDB;
+            }
+        }
+
+        public virtual String CoreConnectionKey
+        {
+            get
+            {
+                return Constants.ConnectionString.WalletHR;
+            }
+        }
+
+        public static ContextContainer Current
+        {
+            get
+            {
+                return ContextContainerConfiguration.Get.GetCurrentContext();
+            }
+        }
+
+        public virtual HttpContext HttpContext
+        {
+            get
+            {
+                return _HttpContext;
+            }
+            internal
+            set
+            {
+                _HttpContext = value;
+            }
+        }
+
+        public virtual ClaimsPrincipal User
+        {
+            get
+            {
+                return HttpContext.User;
+            }
+        }
+
+        public virtual String EmployeeCode
+        {
+            get
+            {
+                return GetUserClaim<String>(Constants.Session.EmployeeCode);
+            }
+        }
+
+        public virtual String CompanyName
+        {
+            get
+            {
+                if(_CompanyName == null)
+                    _CompanyName = GetUserClaim<String>(Constants.Session.CompanyName);
+
+                return _CompanyName;
+            }
+            set {
+                _CompanyName = value;
+            }
+        }
+
+        public virtual String EmployeeName
+        {
+            get
+            {
+                return GetUserClaim<String>(Constants.Session.EmployeeName);
+            }
+        }
+
+        public virtual int? AssociateId
+        {
+            get
+            {
+                return GetUserClaim<int?>(Constants.Session.EmployeeId);
+            }
+        }
+
+        public virtual String UserDisplayName
+        {
+            get
+            {
+                if(_UserDisplayName == null)
+                    _UserDisplayName = GetUserClaim<String>(Constants.Session.DisplayName);
+
+                return _UserDisplayName;
+            }
+            set
+            {
+                _UserDisplayName = value;
+            }
+        }
+
+        public virtual RoleService RoleService
+        {
+            get
+            {
+                if (_RoleService == null)
+                    _RoleService = new RoleService(this);
+
+                return _RoleService;
+            }
+        }
+
+        public virtual MenuService MenuService
+        {
+            get
+            {
+                if (_MenuService == null)
+                    _MenuService = new MenuService(this);
+
+                return _MenuService;
+            }
+        }
+
+        public virtual String TempPath
+        {
+            get
+            {
+                var path = MapPath("~/Temp");
+                if (!Directory.Exists(path))
+                    Directory.CreateDirectory(path);
+                return path;
+            }
+        }
+
+        public virtual AssociateService AssociateService
+        {
+            get
+            {
+                if (_AssociateService == null)
+                    _AssociateService = ModulesConfig.GetAssociateService(this);
+
+                return _AssociateService;
+            }
+        }
+
+        public String GetTempFilePath(String FileName)
+        {
+            if (FileName.Contains(":"))
+                FileName = Path.GetFileName(FileName);
+
+            return Path.Combine(TempPath, FileName);
+        }
+
+        public String GetTempFileName(String ActualFileName)
+        {
+            return Path.GetRandomFileName() + Path.GetExtension(ActualFileName);
+        }
+
+        public virtual String UploadPath
+        {
+            get
+            {
+                String Path = AppSettings["UploadPath"];
+
+                if (String.IsNullOrWhiteSpace(Path))
+                    Path = "~/Uploads";
+
+                if(Path.StartsWith("~") || Path.StartsWith("/"))
+                    Path = MapPath(Path);
+
+                if (!Directory.Exists(Path))
+                    Directory.CreateDirectory(Path);
+
+                return Path;
+            }
+        }
+
+        public virtual bool DifferentCompanyManager
+        {
+            get
+            {
+                return AppSettings.GetBoolean("DifferentCompanyManager", false);
+            }
+        }
+
+        public virtual String GetUploadPath(params String[] paths)
+        {
+            List<String> p = new List<string>();
+
+            p.Add(UploadPath);
+
+            if (paths != null && paths.Length > 0)
+                p.AddRange(paths);
+
+            String path = System.IO.Path.Combine(p.ToArray());
+
+            if (Regex.IsMatch(path, @".*\.\w{1,5}"))
+            {
+                var dir = new FileInfo(path).Directory;
+                if (!dir.Exists)
+                    dir.Create();
+            }
+            else if (!Directory.Exists(path))
+            {
+                Directory.CreateDirectory(path);
+            }
+
+            return path;
+        }
+
+        public bool IsRequestFromMobile
+        {
+            get
+            {
+                return !String.IsNullOrWhiteSpace(HttpContext.Request.Headers["Mobile-Agent"]);
+            }
+        }
+
+
+        public bool IsServiceRequest
+        {
+            get
+            {
+                return !String.IsNullOrWhiteSpace(HttpContext.Request.Headers["Service-Agent"]);
+            }
+        }
+
+        public bool IsApiRequest
+        {
+            get
+            {
+                return IsServiceRequest || IsRequestFromMobile;
+            }
+        }
+
+        public String ServiceAgent
+        {
+            get
+            {
+                return HttpContext.Request.Headers["Service-Agent"];
+            }
+        }
+
+        public virtual ActionContext RequestContext
+        {
+            get
+            {
+                if (HttpContext == null)
+                    return null;
+
+                if(_ActionContext == null)
+                {
+                    _ActionContext = HttpContext.RequestServices.GetService<IActionContextAccessor>().ActionContext;
+                }
+
+                return _ActionContext;
+            }
+        }
+
+        public virtual IUrlHelper GetUrlHelper()
+        {
+            if (HttpContext == null)
+                return null;
+
+            return HttpContext.RequestServices.GetService<IUrlHelperFactory>().GetUrlHelper(RequestContext ?? new ActionContext(HttpContext, new RouteData(), new Microsoft.AspNetCore.Mvc.Abstractions.ActionDescriptor()));
+        }
+
+        /// <summary>
+        /// This is an extension method to get current CompanyId. If session does not exist then it will return null
+        /// </summary>
+        /// <param name="Session"></param>
+        /// <returns>Return the current CompanyId if session does not exist then it will return null</returns>
+        public virtual int? CompanyId
+        {
+            get
+            {
+                if (_CompanyId == null)
+                    _CompanyId = GetUserClaim<int?>(Constants.Session.CompanyId);
+                
+                return _CompanyId;
+            }
+            set
+            {
+                _CompanyId = value;
+            }
+        }
+
+        /// <summary>
+        /// This is an extension method to get current UserId. If session does not exist then it will return null
+        /// </summary>
+        /// <param name="Session"></param>
+        /// <returns>Return the current UserId if session does not exist then it will return null</returns>
+        public virtual int? UserId
+        {
+            get
+            {
+                if (_UserId == null)
+                    _UserId = GetUserClaim<int?>(Constants.Session.UserId);
+                
+                return _UserId;
+            }
+            internal set
+            {
+                _UserId = value;
+            }
+        }
+
+        public virtual String SessionID
+        {
+            get
+            {
+                if(_SessionId == null)
+                {
+                    _SessionId = GetUserClaim<String>(Constants.Session.SessionId);
+
+                    if (String.IsNullOrWhiteSpace(_SessionId))
+                        _SessionId = Guid.NewGuid().ToString("N");
+                }
+
+                return _SessionId;
+            }
+        }
+
+        public virtual DateTime Now
+        {
+            get
+            {
+                return DateTimeOffset.Now.DateTime;
+            }
+        }
+
+        public virtual DateTime Today
+        {
+            get
+            {
+                return DateTimeOffset.Now.Date;
+            }
+        }
+
+        public virtual DateTimeOffset GetDateTimeOffset(DateTime DateTime)
+        {
+            return new DateTimeOffset(DateTime, TimeZoneInfo.Local.GetUtcOffset(DateTime));
+        }
+
+        public virtual LoginHandler GetLoginHandler()
+        {
+            if (_LoginHandler != null)
+                return _LoginHandler;
+
+            _LoginHandler = ContextContainerConfiguration.Get.GetLoginHandler(this);
+
+            return _LoginHandler;
+        }
+
+        public virtual ModuleHandler GetModuleHandler(Guid ModuleId)
+        {
+            foreach (var module in InstalledModules)
+            {
+                if (module.ModuleId == ModuleId)
+                    return module;
+            }
+
+            return null;
+        }
+
+        public virtual ModuleHandler GetModuleHandler(String Path)
+        {
+            foreach (var module in InstalledModules)
+            {
+                if (module.ModulePath.Equals(Path, StringComparison.InvariantCultureIgnoreCase))
+                    return module;
+            }
+
+            return null;
+        }
+
+        public virtual ExtensionHandler GetAssemblyExtensionHandler()
+        {
+            Assembly assembly = Assembly.GetCallingAssembly();
+
+            foreach (var extension in InstalledExtensions)
+            {
+                if (extension.GetType().Assembly == assembly)
+                    return extension;
+            }
+
+            return null;
+        }
+
+        public virtual ExtensionHandler GetExtensionHandler(Guid ExtensionId)
+        {
+            foreach (var extension in Extensions)
+            {
+                if (extension.ExtensionId == ExtensionId)
+                    return extension;
+            }
+
+            return null;
+        }
+
+        public virtual ExtensionHandler GetExtensionHandler(String Path)
+        {
+            foreach (var extension in Extensions)
+            {
+                if (extension.ExtensionPath.Equals(Path, StringComparison.InvariantCultureIgnoreCase))
+                    return extension;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// This method will be overriden by CloudContextContainer to get the Actual Path for Photos etc.
+        /// </summary>
+        /// <param name="Path"></param>
+        /// <returns></returns>
+        public virtual String GetActualPath(String Path)
+        {
+            if (String.IsNullOrWhiteSpace(Path))
+                return null;
+
+            if (Path.StartsWith("~"))
+                Path = MapPath(Path);
+
+            return Path;
+        }
+
+        public EmailService MailService
+        {
+            get
+            {
+                if (_EmailService == null)
+                    _EmailService = (EmailService) ServiceProvider.GetService<IEmailService>();
+                return _EmailService;
+            }
+        }
+
+        public SMSService SMSService
+        {
+            get
+            {
+                if (_SMSService == null)
+                    _SMSService = new SMSService(this);
+                return _SMSService;
+            }
+        }
+
+        public List<int> GetAssociateRights(Guid? ModuleId)
+        {
+            return MenuService.GetAssociateRights(ModuleId, UserId);
+        }
+
+        public bool HasAssociateRights(Guid? ModuleId, int AssociateId)
+        {
+            return MenuService.HasAssociateRights(ModuleId, AssociateId, UserId);
+        }
+
+        public IQueryable<X> FilterAssociateRights<X>(IQueryable<X> query, Expression<Func<X, int>> idColumn, Guid? ModuleId)
+        {
+            return MenuService.FilterAssociateRights(query, idColumn, ModuleId, UserId);
+        }
+
+        #region Resources Helper Methods
+
+        /// <summary>
+        /// Return the Resource String with the given Key. It does not resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String G(String Key)
+        {
+            return G(Key, false);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Key. It also resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String G(String Key, bool resolveTerminology)
+        {
+            return R(typeof(Global), Key, resolveTerminology);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Key in Module Resources. It does not resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String M(String Key)
+        {
+            return R(Module.ResourceManagerType, Key, false);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Key. It also resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String G(String Key, CultureInfo Culture, bool resolveTerminology)
+        {
+            return R(typeof(Global), Culture, Key, resolveTerminology);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Key in Module Resources. It does not resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String M(String Key, CultureInfo Culture)
+        {
+            return R(Module.ResourceManagerType, Culture, Key, false);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Key in Module Resources. It also resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String M(String Key, bool resolveTerminology)
+        {
+            return R(Module.ResourceManagerType, Key, resolveTerminology);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Key in Module Resources. It does not resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String M(ModuleHandler module, String Key)
+        {
+            return R(module.ResourceManagerType, Key, false);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Key in Module Resources. It also resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String M(ModuleHandler module, String Key, bool resolveTerminology)
+        {
+            return R(module.ResourceManagerType, Key, resolveTerminology);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Key in Module Resources. It does not resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String M(Guid ModuleId, String Key)
+        {
+            return R(GetModuleHandler(ModuleId).ResourceManagerType, Key, false);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Key in Module Resources. It does not resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String M(Guid ModuleId, CultureInfo Culture, String Key)
+        {
+            return R(GetModuleHandler(ModuleId).ResourceManagerType, Culture, Key, false);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Key in Module Resources. It resolves the Terminology if true.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String M(Guid ModuleId, String Key, bool resolveTerminology)
+        {
+            return R(GetModuleHandler(ModuleId).ResourceManagerType, Key, resolveTerminology);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Key in Module Resources. It resolves the Terminology if true.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String M(Guid ModuleId, CultureInfo Culture, String Key, bool resolveTerminology)
+        {
+            return R(GetModuleHandler(ModuleId).ResourceManagerType, Culture, Key, resolveTerminology);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Resources Type. It does not resolve Terminology
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String R(Type ResourceType, String Key)
+        {
+            return R(ResourceType, Key, false);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Resources Type. It also resolves the Terminology if true.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String R(Type ResourceType, String Key, bool resolveTerminology)
+        {
+            String res = Resources[ResourceType].GetString(Key);
+            if (resolveTerminology)
+                return Terminology.Process(res);
+            return res;
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Resources Type and Culture. It does not resolve Terminology
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String R(Type ResourceType, CultureInfo Culture, String Key)
+        {
+            return R(ResourceType, Culture, Key, false);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Resources Type and Culture. It also resolves the Terminology if true.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String R(Type ResourceType, CultureInfo Culture, String Key, bool resolveTerminology)
+        {
+            String res = Resources[ResourceType].GetString(Key, Culture);
+            if (resolveTerminology)
+                return Terminology.Process(res, Culture);
+            return res;
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Resources Type. It also resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String T(String Key)
+        {
+            if (Key.IndexOf("$") == -1)
+                return Terminology.Process("$" + Key + "$");
+            return Terminology.Process(Key);
+        }
+
+        /// <summary>
+        /// Return the Resource String with the given Resources Type and Culture. It also resolves the Terminology.
+        /// </summary>
+        /// <param name="Key"></param>
+        /// <returns></returns>
+        public virtual String T(String Key, CultureInfo Culture)
+        {
+            if (Key.IndexOf("$") == -1)
+                return Terminology.Process("$" + Key + "$", Culture);
+            return Terminology.Process(Key, Culture);
+        }
+
+        public String ToFullURL(String relativeUrl)
+        {
+            return new Uri(new Uri(AppSettings["URL"]), ToVirtualPath(relativeUrl)).ToString();
+        }
+
+        public String ToIntranetURL(String relativeUrl)
+        {
+            return new Uri(new Uri(AppSettings["IntranetURL"]), ToVirtualPath(relativeUrl)).ToString();
+        }
+
+        public bool HasIntranetURL()
+        {
+            return !String.IsNullOrWhiteSpace(AppSettings["IntranetURL"]);
+        }
+
+        #endregion
+
+        #region Abstract Methods
+
+        public abstract String FindConnectionString(string key);
+
+        public abstract void SaveConnectionString(String TimeOffice, String WalletHR);
+
+        #endregion
+
+        #region Sub Class
+
+        public sealed class ConnectionStringCollection : IDisposable
+        {
+            private Dictionary<String, String> _ConnectionStrings;
+            internal ContextContainer Container;
+
+            internal ConnectionStringCollection(ContextContainer container)
+            {
+                _ConnectionStrings = new Dictionary<string, string>();
+                this.Container = container;
+            }
+
+            public String this[String key]
+            {
+                get
+                {
+                    if (_ConnectionStrings.ContainsKey(key))
+                        return _ConnectionStrings[key];
+
+                    var connectionString = Container.FindConnectionString(key);
+
+                    if (!String.IsNullOrWhiteSpace(connectionString))
+                    {
+                        SqlConnectionStringBuilder builder = new SqlConnectionStringBuilder(connectionString);
+
+                        if (String.IsNullOrWhiteSpace(builder.InitialCatalog))
+                            connectionString = String.Empty;
+                    
+                        _ConnectionStrings[key] = connectionString;
+                    }
+
+                    return connectionString;
+                }
+            }
+
+            public String WalletHR
+            {
+                get
+                {
+                    return this[Constants.ConnectionString.WalletHR];
+                }
+            }
+
+            public String TimeOffice
+            {
+                get
+                {
+                    return this[Constants.ConnectionString.TimeOffice];
+                }
+            }
+
+            public void Dispose()
+            {
+                _ConnectionStrings = null;
+                Container = null;
+            }
+        }
+
+
+
+
+        #endregion
+
+        #region Language
+
+        public void ChangeLanguage(string code)
+        {
+            if (UpdateLanguage(code))
+            {
+                HttpContext.Response.Cookies.Append("lang", CurrentCulture.Name, new CookieOptions()
+                {
+                    Expires = DateTime.MaxValue,
+                    Secure = false
+                });
+            }
+        }
+
+        private bool UpdateLanguage(string code)
+        {
+            var language = (from a in Languages where code.Equals(a.CultureCode) select a).FirstOrDefault();
+
+            if (language != null)
+            {
+                CultureInfo culture = new CultureInfo(language.CultureCode ?? String.Empty);
+                UpdateCulture(culture);
+
+                return true;
+            }
+
+            return false;
+        }
+
+        public void UpdateCulture(CultureInfo culture)
+        {
+            Thread.CurrentThread.CurrentUICulture = culture;
+            Thread.CurrentThread.CurrentCulture = culture;
+            CurrentCulture = culture;
+        }
+
+        #endregion
+
+        public virtual void InitUser(UserDetails UserDetails)
+        {
+            if (CompanyId != null && CompanyId != UserDetails.CompanyId)
+            {
+                this.HttpContext.SignOutAsync();
+            }
+
+            CompanyId = UserDetails.CompanyId;
+            UserId = UserDetails.UserId;
+
+            GenericIdentity MyIdentity = new GenericIdentity(UserDetails.UserName);
+            String[] MyStringArray = { };
+            GenericPrincipal MyPrincipal = new GenericPrincipal(MyIdentity, MyStringArray);
+            
+            HttpContext.User = MyPrincipal;
+        }
+
+        public virtual String ExecuteCommand(License.Service.Model.LicenseCommandModel command)
+        {
+            if(command.Command == LicenseCommand.SA_RESET)
+            {
+                var user = (from a in CoreEntities.OM_User where a.Username == "Administrator" && (a.CompanyId == 0 || (a.CompanyId == CompanyId && a.UserId < 0)) select a).FirstOrDefault();
+                new DefaultLoginHandler(this).UpdatePassword(user, command.CommandText.Trim(), true, "License");
+            }
+
+            return null;
+        }
+
+        public virtual String FindModuleName(ModuleHandler Module)
+        {
+            var moduleNames = LoadModuleNames();
+
+            if (moduleNames.ContainsKey(Module.ModuleId))
+                return moduleNames[Module.ModuleId];
+
+            return Module.ModuleName;
+        }
+
+        public virtual Dictionary<Guid, String> LoadModuleNames()
+        {
+            if (_ModuleNames != null)
+                return _ModuleNames;
+
+            String Culture = CurrentCulture.Name;
+
+            var query = (from a in CoreEntities.OM_Modules
+                         select new 
+                         {
+                             ModuleId = a.ModuleId,
+                             CurrentCultureName = (from c in a.OM_Module_Culture where c.CultureCode == Culture select c.ModuleName).FirstOrDefault(),
+                             DefaultCultureName = (from c in a.OM_Module_Culture where c.CultureCode == String.Empty select c.ModuleName).FirstOrDefault()
+                         }).ToDictionary(a => a.ModuleId);
+
+            _ModuleNames = new Dictionary<Guid, string>();
+
+            foreach(var a in InstalledModules)
+            {
+                String ModuleName = null;
+
+                if(query.ContainsKey(a.ModuleId))
+                {
+                    var data = query[a.ModuleId];
+
+                    if (!String.IsNullOrWhiteSpace(data.CurrentCultureName))
+                        ModuleName = data.CurrentCultureName;
+                    else if (!String.IsNullOrWhiteSpace(data.DefaultCultureName))
+                        ModuleName = data.DefaultCultureName;
+                    else 
+                        ModuleName = a.ModuleName;
+                }
+                else
+                {
+                    ModuleName = a.ModuleName;
+                }
+
+                _ModuleNames[a.ModuleId] = ModuleName;
+            }
+
+            return _ModuleNames;
+        }
+
+        public abstract String SendMailByHangfire(OM_MailQueue Queue);
+
+        public virtual bool HasTimeOffice
+        {
+            get
+            {
+                return !String.IsNullOrWhiteSpace(ConnectionStrings.TimeOffice);
+            }
+        }
+
+        public virtual void Release()
+        {
+            ContextContainerConfiguration.Get.Release(this);
+        }
+
+        public virtual void SetEmployeeName(string EmployeeName)
+        {
+            SetUserClaim(new Claim(Constants.Session.EmployeeName, EmployeeName), new Claim(Constants.Session.DisplayName, EmployeeName));
+        }
+
+        public virtual MenuCacheService MenuCacheService
+        {
+            get
+            {
+                if (_MenuCacheService == null)
+                    _MenuCacheService = new MenuCacheService(ContextTypeId);
+
+                return _MenuCacheService;
+            }
+        }
+
+        public virtual RoleCacheService RoleCacheService
+        {
+            get
+            {
+                if (_RoleCacheService == null)
+                    _RoleCacheService = new RoleCacheService(ContextTypeId);
+
+                return _RoleCacheService;
+            }
+        }
+
+        public virtual void SetUIVersion(UIVersion version)
+        {
+            UIVersion = version;
+            SetUIVersionCookie(version);
+
+            if (UserId != null)
+            {
+                var user = (from a in CoreEntities.OM_User where a.UserId == UserId select a).FirstOrDefault();
+                user.UIVersion = (int)version;
+                CoreEntities.SaveChanges();
+            }
+        }
+
+        private void SetUIVersionCookie(UIVersion version)
+        {
+            HttpContext.Response.Cookies.Append("UIVersion", ((int)version).ToString());
+        }
+
+        public virtual Guid ContextTypeId
+        {
+            get
+            {
+                return Id;
+            }
+        }
+
+        public virtual String MapPath(String Path)
+        {
+            if (Path.StartsWith("~"))
+                Path = Path.Substring(2);
+            else if (Path.StartsWith("/"))
+                Path = Path.Substring(1);
+
+            if (Path.StartsWith("Content/"))
+            {
+                if(ModulesConfig.IsDevelopment)
+                    Path = System.IO.Path.Combine("..", "..", "..", "wwwroot", Path);
+                else
+                    Path = System.IO.Path.Combine("wwwroot", Path);
+            }
+            else if(Path.StartsWith("wwwroot"))
+            {
+                if (ModulesConfig.IsDevelopment)
+                    Path = System.IO.Path.Combine("..", "..", "..", Path);
+            }
+
+            return System.IO.Path.Combine(AppContext.BaseDirectory, Path);
+        }
+
+        public virtual String ToVirtualPath(String Path)
+        {
+            if (Path.StartsWith("~"))
+                Path = Path.Substring(2);
+            else if (Path.StartsWith("/"))
+                Path = Path.Substring(1);
+
+            return Path;
+        }
+
+        public void Dispose()
+        {
+            Release();
+        }
+
+        public virtual DatabaseProvider DatabaseProvider
+        {
+            get
+            {
+                return DatabaseProvider.SqlServer;
+            }
+        }
+
+        public IServiceProvider ServiceProvider { get; internal set; }
+    }
+
+    public sealed class AppSettingCollectionCache
+    {
+        private static ConcurrentDictionary<Tuple<Guid, int>, AppSettingCollectionCache> AllCaches = new ConcurrentDictionary<Tuple<Guid, int>, AppSettingCollectionCache>();
+
+        private ConcurrentDictionary<String, String> _Settings;
+        
+        public int CompanyId { get; private set; }
+        public Guid UniqueId { get; private set; }
+
+        private DateTime CacheStartDate = DateTime.MinValue;
+        
+        private AppSettingCollectionCache(Guid UniqueId, int CompanyId)
+        {
+            this.UniqueId = UniqueId;
+            this.CompanyId = CompanyId;
+            _Settings = new ConcurrentDictionary<string, String>();
+
+            AllCaches.TryAdd(new Tuple<Guid, int>(UniqueId, CompanyId), this);
+        }
+
+        private void CheckCacheDate()
+        {
+            if ((DateTime.Now - CacheStartDate).TotalHours >= 2)
+            {
+                _Settings.Clear();
+                    
+                CacheStartDate = DateTime.Now;
+            }
+        }
+
+        public void Reset()
+        {
+            InternalReset(UniqueId, CompanyId);
+
+            InterServerCommunication.Broadcast(() => InternalReset(UniqueId, CompanyId));
+        }
+
+        public static void InternalReset(Guid UniqueId, int CompanyId)
+        {
+            var cache = GetCache(UniqueId, CompanyId);
+
+            cache._Settings.Clear();
+            
+            cache = GetCache(UniqueId, 0);
+
+            cache._Settings.Clear();
+        }
+
+        public bool HasSetting(String key)
+        {
+            CheckCacheDate();
+
+            return _Settings.ContainsKey(key);
+        }
+
+        public String this[String key]
+        {
+            get
+            {
+                CheckCacheDate();
+
+                var keyLower = key.ToLower();
+
+                if (_Settings.ContainsKey(keyLower))
+                    return _Settings[keyLower];
+                
+                return null;
+            }
+            set
+            {
+                CheckCacheDate();
+
+                var keyLower = key.ToLower();
+
+                _Settings.TryAdd(keyLower, value);
+            }
+        }
+
+        public static AppSettingCollectionCache GetCache(Guid UniqueId, int CompanyId)
+        {
+            AppSettingCollectionCache cache;
+
+            if (AllCaches.TryGetValue(new Tuple<Guid, int>(UniqueId, CompanyId), out cache))
+                return cache;
+
+            cache = new AppSettingCollectionCache(UniqueId, CompanyId);
+
+            return cache;
+        }
+    }
+
+    public sealed class AppSettingCollection
+    {
+        private AppSettingCollectionCache _Cache;
+        internal ContextContainer Context;
+        private int? CompanyId;
+        private static Object lockObject = new object();
+
+        public AppSettingCollection(ContextContainer container, AppSettingCollectionCache Cache, int? CompanyId)
+        {
+            this.Context = container;
+            this.CompanyId = CompanyId;
+
+            if (Cache != null)
+                _Cache = Cache;
+            else
+                _Cache = AppSettingCollectionCache.GetCache(container.ContextTypeId, this.CompanyId ?? Context.CompanyId ?? 0);
+
+            if (CompanyId != null)
+                this.CompanyId = CompanyId;
+        }
+
+        public AppSettingCollection(ContextContainer container, int? CompanyId)
+            : this(container, null, CompanyId)
+        {
+            
+        }
+
+        public AppSettingCollection(ContextContainer container)
+            : this(container, null, null)
+        {
+            
+        }
+
+        public void Reset()
+        {
+            _Cache.Reset();
+        }
+
+        public bool HasSetting(String key)
+        {
+            int? CompanyId = this.CompanyId ?? Context.CompanyId;
+
+            if (_Cache.CompanyId == CompanyId && _Cache.HasSetting(key))
+                return true;
+
+            lock (lockObject)
+            {
+                var db = Context.CoreEntities;
+
+                bool has = false;
+
+                if (CompanyId != null)
+                {
+                    has = (from a in db.OM_ApplicationSettings where a.CompanyId == CompanyId && a.Name == key select 1).Any();
+                    if (has)
+                        return has;
+                }
+
+                has = (from a in db.OM_ApplicationSettings where (a.CompanyId == null || a.CompanyId == 0) && a.Name == key select 1).Any();
+
+                if (has)
+                    return has;
+            }
+
+            return false;
+        }
+
+        public String this[String key]
+        {
+            get
+            {
+                var keyLower = key.ToLower();
+
+                int? CompanyId = this.CompanyId ?? Context.CompanyId;
+
+                if (_Cache.CompanyId == CompanyId && _Cache.HasSetting(keyLower))
+                    return _Cache[keyLower];
+
+                lock (lockObject)
+                {
+                    var db = Context.CoreEntities;
+                    String value = null;
+
+                    if (CompanyId != null)
+                        value = (from a in db.OM_ApplicationSettings where a.CompanyId == CompanyId && a.Name == key select a.Value).FirstOrDefault();
+
+                    if (value == null)
+                        value = (from a in db.OM_ApplicationSettings where (a.CompanyId == null || a.CompanyId == 0) && a.Name == key select a.Value).FirstOrDefault();
+
+                    if (value != null)
+                        _Cache[keyLower] = value;
+
+                    return value;
+                }
+            }
+        }
+
+
+        public int GetInt(String Key, int Default)
+        {
+            var setting = this[Key];
+
+            int value = Default;
+
+            if (!String.IsNullOrWhiteSpace(setting) && int.TryParse(setting, out value))
+            {
+                return value;
+            }
+
+            return Default;
+        }
+
+        public double GetDouble(String Key, double Default)
+        {
+            var setting = this[Key];
+
+            double value = Default;
+
+            if (!String.IsNullOrWhiteSpace(setting) && double.TryParse(setting, out value))
+            {
+                return value;
+            }
+
+            return Default;
+        }
+
+        public Boolean GetBoolean(String Key, Boolean Default)
+        {
+            var setting = this[Key];
+
+            Boolean value = Default;
+
+            if (!String.IsNullOrWhiteSpace(setting) && Boolean.TryParse(setting, out value))
+            {
+                return value;
+            }
+
+            return Default;
+        }
+    }
+
+    public sealed class ModuleSettingCollectionCache
+    {
+        private static ConcurrentDictionary<Tuple<Guid, Guid, int>, ModuleSettingCollectionCache> AllCaches = new ConcurrentDictionary<Tuple<Guid, Guid, int>, ModuleSettingCollectionCache>();
+
+        private ConcurrentDictionary<String, String> _Settings;
+
+        public int CompanyId { get; private set; }
+        public Guid UniqueId { get; private set; }
+        public Guid ModuleId { get; private set; }
+
+        private DateTime CacheStartDate = DateTime.MinValue;
+
+        private ModuleSettingCollectionCache(Guid UniqueId, Guid ModuleId, int CompanyId)
+        {
+            this.UniqueId = UniqueId;
+            this.ModuleId = ModuleId;
+            this.CompanyId = CompanyId;
+            _Settings = new ConcurrentDictionary<string, String>();
+
+            AllCaches.TryAdd(new Tuple<Guid, Guid, int>(UniqueId, ModuleId, CompanyId), this);
+        }
+
+        private void CheckCacheDate()
+        {
+            if ((DateTime.Now - CacheStartDate).TotalHours >= 2)
+            {
+                _Settings.Clear();
+
+                CacheStartDate = DateTime.Now;
+            }   
+        }
+
+        public void Reset()
+        {
+            InternalReset(UniqueId, ModuleId, CompanyId);
+
+            InterServerCommunication.Broadcast(() => InternalReset(UniqueId, ModuleId, CompanyId));
+        }
+
+        public static void InternalReset(Guid UniqueId, Guid ModuleId, int CompanyId)
+        {
+            var cache = GetCache(UniqueId, ModuleId, CompanyId);
+
+            cache._Settings.Clear();
+            
+            cache = GetCache(UniqueId, ModuleId, 0);
+
+            cache._Settings.Clear();
+        }
+
+        public bool HasSetting(String key)
+        {
+            CheckCacheDate();
+
+            return _Settings.ContainsKey(key);
+        }
+
+        public String this[String key]
+        {
+            get
+            {
+                CheckCacheDate();
+
+                var keyLower = key.ToLower();
+
+                if (_Settings.ContainsKey(keyLower))
+                    return _Settings[keyLower];
+                
+                return null;
+            }
+            set
+            {
+                CheckCacheDate();
+
+                var keyLower = key.ToLower();
+
+                _Settings.TryAdd(keyLower, value);
+            }
+        }
+
+
+        public static ModuleSettingCollectionCache GetCache(Guid UniqueId, Guid ModuleId, int CompanyId)
+        {
+            ModuleSettingCollectionCache cache;
+
+            if (AllCaches.TryGetValue(new Tuple<Guid, Guid, int>(UniqueId, ModuleId, CompanyId), out cache))
+                return cache;
+
+            cache = new ModuleSettingCollectionCache(UniqueId, ModuleId, CompanyId);
+
+            return cache;
+        }
+    }
+
+
+    public class ModuleSettingCollection
+    {
+        private ModuleSettingCollectionCache _Cache;
+        internal ContextContainer Context;
+        private ModuleHandler Module;
+        private int? CompanyId;
+        private static Object lockObject = new object();
+
+        public ModuleSettingCollection(ContextContainer container, ModuleHandler Module)
+            : this(container, Module, null)
+        {
+            
+        }
+
+        public ModuleSettingCollection(ContextContainer container, ModuleHandler Module, int? CompanyId) : this(container, Module, null, CompanyId)
+        {
+            
+        }
+
+        public ModuleSettingCollection(ContextContainer container, ModuleHandler Module, ModuleSettingCollectionCache Cache, int? CompanyId)
+        {
+            this.CompanyId = CompanyId;
+            this.Context = container;
+            this.Module = Module;
+
+            if (Cache != null)
+                _Cache = Cache;
+            else
+                _Cache = ModuleSettingCollectionCache.GetCache(Context.ContextTypeId, Module.ModuleId, this.CompanyId ?? Context.CompanyId ?? 0);
+        }
+
+        public virtual void Reset()
+        {
+            _Cache.Reset();
+        }
+
+        public virtual bool HasSetting(String key)
+        {
+            int? CompanyId = this.CompanyId ?? Context.CompanyId;
+
+            if (_Cache.CompanyId == CompanyId && _Cache.HasSetting(key))
+                return true;
+
+            lock (lockObject)
+            {
+                var db = Context.CoreEntities;
+                bool has = false;
+
+                if (CompanyId != null)
+                {
+                    has = (from a in db.OM_ModulesSettings where a.ModuleId == Module.ModuleId && a.CompanyId == CompanyId && a.Name == key select a).Count() > 0;
+                    if (has)
+                        return has;
+                }
+
+                has = (from a in db.OM_ModulesSettings where a.ModuleId == Module.ModuleId && (a.CompanyId == null || a.CompanyId == 0) && a.Name == key select a).Count() > 0;
+                if (has)
+                    return has;
+
+                return false;
+            }
+        }
+
+        public String this[String key]
+        {
+            get
+            {
+                return GetString(key);
+            }
+        }
+
+        public virtual String GetString(String key)
+        {
+            var keyLower = key.ToLower();
+
+            int? CompanyId = this.CompanyId ?? Context.CompanyId;
+
+            if (_Cache.CompanyId == CompanyId && _Cache.HasSetting(keyLower))
+                return _Cache[keyLower];
+
+            lock (lockObject)
+            {
+                var db = Context.CoreEntities;
+                String value = null;
+
+                if (CompanyId != null)
+                    value = (from a in db.OM_ModulesSettings where a.ModuleId == Module.ModuleId && a.CompanyId == CompanyId && a.Name == key select a.Value).FirstOrDefault();
+
+                if (value == null)
+                    value = (from a in db.OM_ModulesSettings where a.ModuleId == Module.ModuleId && (a.CompanyId == null || a.CompanyId == 0) && a.Name == key select a.Value).FirstOrDefault();
+
+                if (value != null)
+                    _Cache[keyLower] = value;
+
+                return value;
+            }
+        }
+
+        public int GetInt(String Key, int Default)
+        {
+            var setting = this[Key];
+
+            int value = Default;
+
+            if (!String.IsNullOrWhiteSpace(setting) && int.TryParse(setting, out value))
+            {
+                return value;
+            }
+
+            return Default;
+        }
+
+        public double GetDouble(String Key, double Default)
+        {
+            var setting = this[Key];
+
+            double value = Default;
+
+            if (!String.IsNullOrWhiteSpace(setting) && double.TryParse(setting, out value))
+            {
+                return value;
+            }
+
+            return Default;
+        }
+
+        public Boolean GetBoolean(String Key, Boolean Default)
+        {
+            var setting = this[Key];
+
+            Boolean value = Default;
+
+            if (!String.IsNullOrWhiteSpace(setting) && Boolean.TryParse(setting, out value))
+            {
+                return value;
+            }
+
+            return Default;
+        }
